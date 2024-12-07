@@ -37,42 +37,57 @@ char *getHistoryCommand(int index);
 
 // Main shell loop
 int main() {
-    char input[1024];
+    char input[1024]; // Buffer for user input
 
     while (1) {
+        // Prompt
         printf("myshell> ");
         if (!fgets(input, sizeof(input), stdin)) {
-            break;
+            break; // Exit loop if EOF (Ctrl+D) or error occurs
         }
 
         if (strlen(input) <= 1) {
-            continue; // Skip empty input
+            continue; // Ignore empty input
         }
 
+        // Add the command to history
         addHistory(input);
 
+        // Parse the command line
         cmdLine *cmd = parseCmdLines(input);
         if (!cmd) {
-            continue;
+            continue; // Skip invalid input
         }
 
-        // Built-in commands
+        // Built-in commands handling
         if (strcmp(cmd->arguments[0], "history") == 0) {
             printHistory();
         } else if (strcmp(cmd->arguments[0], "!!") == 0) {
-            char *lastCommand = getHistoryCommand(historyCount);
+            char *lastCommand = getHistoryCommand(historyCount); // Get last command
             if (lastCommand) {
                 cmdLine *lastCmd = parseCmdLines(lastCommand);
-                executeCommand(lastCmd);
-                freeCmdLines(lastCmd);
+                if (lastCmd) {
+                    executeCommand(lastCmd); // Execute the last command
+                    freeCmdLines(lastCmd);
+                } else {
+                    fprintf(stderr, "Error: Failed to parse last command.\n");
+                }
+            } else {
+                fprintf(stderr, "Error: No previous command found.\n");
             }
         } else if (cmd->arguments[0][0] == '!') {
-            int index = atoi(&cmd->arguments[0][1]);
+            int index = atoi(&cmd->arguments[0][1]); // Extract index from !n
             char *historyCommand = getHistoryCommand(index);
             if (historyCommand) {
                 cmdLine *histCmd = parseCmdLines(historyCommand);
-                executeCommand(histCmd);
-                freeCmdLines(histCmd);
+                if (histCmd) {
+                    executeCommand(histCmd); // Execute the command at index
+                    freeCmdLines(histCmd);
+                } else {
+                    fprintf(stderr, "Error: Failed to parse command at history index %d.\n", index);
+                }
+            } else {
+                fprintf(stderr, "Error: No command found at index %d.\n", index);
             }
         } else if (strcmp(cmd->arguments[0], "procs") == 0) {
             printProcessList(&processList);
@@ -86,14 +101,16 @@ int main() {
             pid_t pid = atoi(cmd->arguments[1]);
             signalProcess(&processList, pid, SIGINT);
         } else {
-            executeCommand(cmd);
+            executeCommand(cmd); // Execute external commands or pipelines
         }
 
+        // Free command line structure
         freeCmdLines(cmd);
     }
 
     return 0;
 }
+
 
 // Execute a single command
 void executeCommand(cmdLine *cmd) {
@@ -130,51 +147,49 @@ void executeCommand(cmdLine *cmd) {
 
 // Execute a pipeline of two commands
 void executePipeline(cmdLine *cmd) {
-    int pipefd[2];
-    if (pipe(pipefd) == -1) {
-        perror("pipe");
-        return;
+    int pipefd[2];           // Pipe file descriptors
+    int inputFd = 0;         // Input for the next command
+    pid_t pid;
+
+    while (cmd->next) {
+        pipe(pipefd);        // Create a new pipe
+
+        if ((pid = fork()) == -1) {
+            perror("fork");
+            exit(EXIT_FAILURE);
+        }
+
+        if (pid == 0) { // Child process
+            dup2(inputFd, STDIN_FILENO);  // Set the input for the current process
+            dup2(pipefd[1], STDOUT_FILENO); // Redirect stdout to pipe
+            close(pipefd[0]); // Close unused read end
+            execvp(cmd->arguments[0], cmd->arguments);
+            perror("execvp");
+            exit(EXIT_FAILURE);
+        } else {
+            waitpid(pid, NULL, 0); // Parent waits for the child
+            close(pipefd[1]);      // Close unused write end
+            inputFd = pipefd[0];   // Save read end for the next command
+            cmd = cmd->next;       // Move to the next command in the pipeline
+        }
     }
 
-    pid_t child1 = fork();
-    if (child1 == -1) {
+    // Last command in the pipeline
+    if ((pid = fork()) == -1) {
         perror("fork");
-        return;
+        exit(EXIT_FAILURE);
     }
 
-    if (child1 == 0) { // First child
-        close(STDOUT_FILENO);
-        dup(pipefd[1]);
-        close(pipefd[0]);
-        close(pipefd[1]);
-
+    if (pid == 0) {
+        dup2(inputFd, STDIN_FILENO); // Set input for the final process
         execvp(cmd->arguments[0], cmd->arguments);
         perror("execvp");
         exit(EXIT_FAILURE);
+    } else {
+        waitpid(pid, NULL, 0); // Parent waits for the final child
     }
-
-    pid_t child2 = fork();
-    if (child2 == -1) {
-        perror("fork");
-        return;
-    }
-
-    if (child2 == 0) { // Second child
-        close(STDIN_FILENO);
-        dup(pipefd[0]);
-        close(pipefd[1]);
-        close(pipefd[0]);
-
-        execvp(cmd->next->arguments[0], cmd->next->arguments);
-        perror("execvp");
-        exit(EXIT_FAILURE);
-    }
-
-    close(pipefd[0]);
-    close(pipefd[1]);
-    waitpid(child1, NULL, 0);
-    waitpid(child2, NULL, 0);
 }
+
 
 // Add a process to the process list
 void addProcess(process **processList, cmdLine *cmd, pid_t pid) {
@@ -221,6 +236,12 @@ void signalProcess(process **processList, pid_t pid, int signal) {
 
 // Add a command to history
 void addHistory(char *cmd) {
+    // Trim trailing newline
+    size_t len = strlen(cmd);
+    if (len > 0 && cmd[len - 1] == '\n') {
+        cmd[len - 1] = '\0';
+    }
+
     if (historyCount == HISTLEN) {
         free(history[0]);
         for (int i = 1; i < HISTLEN; i++) {
@@ -229,13 +250,6 @@ void addHistory(char *cmd) {
         historyCount--;
     }
     history[historyCount++] = strdup(cmd);
-}
-
-// Print the history
-void printHistory() {
-    for (int i = 0; i < historyCount; i++) {
-        printf("%d %s\n", i + 1, history[i]);
-    }
 }
 
 // Get a command from history
