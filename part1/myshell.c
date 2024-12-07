@@ -260,3 +260,9 @@ char *getHistoryCommand(int index) {
     }
     return history[index - 1];
 }
+
+void printHistory() {
+    for (int i = 0; i < historyCount; i++) {
+        printf("%d %s\n", i + 1, history[i]); // Print command index and command string
+    }
+}
