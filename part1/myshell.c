@@ -1,268 +1,226 @@
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
-#include <sys/types.h>
-#include <sys/wait.h>
+#include <sys/syscall.h>
 #include <signal.h>
+#include <string.h>
+#include <linux/limits.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include "LineParser.h"
 
-#define HISTLEN 10
-#define TERMINATED -1
-#define RUNNING 1
-#define SUSPENDED 0
+#define Max_String 2048
 
-// Process structure
-typedef struct process {
-    cmdLine *cmd;
-    pid_t pid;
-    int status;
-    struct process *next;
-} process;
+int debug_mode = 0;
+FILE *outfile;
 
-process *processList = NULL;  // Global process list
-char *history[HISTLEN];       // History queue
-int historyCount = 0;         // History counter
+void execute(cmdLine *cmdLine);
+void setDebugMode(int argc, char **argv);
+int stoierr(char *str);
+void handleExit(char *msg, int errKind, int toExit, int errCode, int exit_kind, cmdLine *cmdLine);
+void handleCWD();
+cmdLine *handleInputAndParse();
+int validCmdLine(cmdLine *cmdLine);
+int handleSpecialCommand(cmdLine *cmdLine);
+void handleSignalCommand(cmdLine *cmdLine);
+void handleRedirection(const char *filePath, int targetFd, int flags, cmdLine *pCmdLine);
 
-// Function prototypes
-void executeCommand(cmdLine *cmd);
-void executePipeline(cmdLine *cmd);
-void addProcess(process **processList, cmdLine *cmd, pid_t pid);
-void printProcessList(process **processList);
-void updateProcessList(process **processList);
-void signalProcess(process **processList, pid_t pid, int signal);
-void addHistory(char *cmd);
-void printHistory();
-char *getHistoryCommand(int index);
+int main(int argc, char **argv)
+{
+    cmdLine *cmdLine;
+    setDebugMode(argc, argv);
 
-// Main shell loop
-int main() {
-    char input[1024]; // Buffer for user input
+    while (1)
+    {
+        handleCWD();
+        cmdLine = handleInputAndParse();
+        if (!validCmdLine(cmdLine) || !handleSpecialCommand(cmdLine))
+            continue;
 
-    while (1) {
-        // Prompt
-        printf("myshell> ");
-        if (!fgets(input, sizeof(input), stdin)) {
-            break; // Exit loop if EOF (Ctrl+D) or error occurs
-        }
-
-        if (strlen(input) <= 1) {
-            continue; // Ignore empty input
-        }
-
-        // Add the command to history
-        addHistory(input);
-
-        // Parse the command line
-        cmdLine *cmd = parseCmdLines(input);
-        if (!cmd) {
-            continue; // Skip invalid input
-        }
-
-        // Built-in commands handling
-        if (strcmp(cmd->arguments[0], "history") == 0) {
-            printHistory();
-        } else if (strcmp(cmd->arguments[0], "!!") == 0) {
-            char *lastCommand = getHistoryCommand(historyCount); // Get last command
-            if (lastCommand) {
-                cmdLine *lastCmd = parseCmdLines(lastCommand);
-                if (lastCmd) {
-                    executeCommand(lastCmd); // Execute the last command
-                    freeCmdLines(lastCmd);
-                } else {
-                    fprintf(stderr, "Error: Failed to parse last command.\n");
-                }
-            } else {
-                fprintf(stderr, "Error: No previous command found.\n");
-            }
-        } else if (cmd->arguments[0][0] == '!') {
-            int index = atoi(&cmd->arguments[0][1]); // Extract index from !n
-            char *historyCommand = getHistoryCommand(index);
-            if (historyCommand) {
-                cmdLine *histCmd = parseCmdLines(historyCommand);
-                if (histCmd) {
-                    executeCommand(histCmd); // Execute the command at index
-                    freeCmdLines(histCmd);
-                } else {
-                    fprintf(stderr, "Error: Failed to parse command at history index %d.\n", index);
-                }
-            } else {
-                fprintf(stderr, "Error: No command found at index %d.\n", index);
-            }
-        } else if (strcmp(cmd->arguments[0], "procs") == 0) {
-            printProcessList(&processList);
-        } else if (strcmp(cmd->arguments[0], "stop") == 0 && cmd->argCount > 1) {
-            pid_t pid = atoi(cmd->arguments[1]);
-            signalProcess(&processList, pid, SIGTSTP);
-        } else if (strcmp(cmd->arguments[0], "wake") == 0 && cmd->argCount > 1) {
-            pid_t pid = atoi(cmd->arguments[1]);
-            signalProcess(&processList, pid, SIGCONT);
-        } else if (strcmp(cmd->arguments[0], "term") == 0 && cmd->argCount > 1) {
-            pid_t pid = atoi(cmd->arguments[1]);
-            signalProcess(&processList, pid, SIGINT);
-        } else {
-            executeCommand(cmd); // Execute external commands or pipelines
-        }
-
-        // Free command line structure
-        freeCmdLines(cmd);
+        handleSignalCommand(cmdLine);
     }
-
     return 0;
 }
 
+// Execute the command
+void execute(cmdLine *pCmdLine)
+{
+    int temp, stat_loc;
+    int ProcessID = fork();
 
-// Execute a single command
-void executeCommand(cmdLine *cmd) {
-    if (cmd->next) {
-        executePipeline(cmd);
+    if (ProcessID == -1)
+        handleExit("Error in Forking: ", 1, 1, 1, 0, pCmdLine);
+
+    // Child Process
+    if (ProcessID == 0)
+    {
+        if (debug_mode)
+            fprintf(stderr, "PID: %d\n  Executing Command: %s\n\n", ProcessID, pCmdLine->arguments[0]);
+
+        // Handle redirections
+        handleRedirection(pCmdLine->inputRedirect, STDIN_FILENO, O_RDONLY | O_CREAT, pCmdLine);
+        handleRedirection(pCmdLine->outputRedirect, STDOUT_FILENO, O_WRONLY | O_CREAT, pCmdLine);
+
+        // Check if the command is executable
+        if (execvp(pCmdLine->arguments[0], pCmdLine->arguments) == -1)
+            handleExit("Error in executing the command", 1, 1, EXIT_FAILURE, 0, pCmdLine);
+    }
+
+    // Parent Process.. Wait for the child to finish ProcessID>0
+    else if (pCmdLine->blocking && waitpid(ProcessID, &stat_loc, 0) == -1)
+        handleExit("Error in waiting for the child process", 1, 0, 0, 0, pCmdLine);
+}
+
+// Debug Mode Function - Looking for -d or -D
+void setDebugMode(int argc, char **argv)
+{
+    for (int i = 1; i < argc; i++)
+        if ((strcmp(argv[i], "-D") || !strcmp(argv[i], "-d")) && !debug_mode)
+            debug_mode = 1;
+
+    outfile = debug_mode ? stderr : stdout;
+}
+
+// Convert String to Integer
+int stoierr(char *str)
+{
+    int val;
+    // Check if the conversion was successful, if not print an error message and exit
+    if (!sscanf(str, "%d", &val))
+        handleExit("Error in converting string to integer", 1, 1, EXIT_FAILURE, 1, NULL);
+
+    return val;
+}
+
+/**
+
+ *  Handle Exit Function
+ *
+ *  msg - Error Message
+ *  errKind - Error Kind (1 for perror, 0 for fprintf)
+ *  toExit - Exit the program or not
+ *  errCode - Error Code
+ *  cmdLine - Command Line to free
+ *  exit_kind - 0 for _exit, 1 for exit
+*/
+void handleExit(char *msg, int errKind, int toExit, int errCode, int exit_kind, cmdLine *cmdLine)
+{
+    if (msg != NULL)
+        if (errKind)
+            perror(msg);
+        else
+            fprintf(stderr, "%s\n", msg);
+
+    if (cmdLine)
+        freeCmdLines(cmdLine);
+
+    if (toExit)
+        if (exit_kind)
+            exit(errCode);
+        else
+            _exit(errCode);
+}
+
+// Handle the Current Working Directory
+void handleCWD()
+{
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd)))
+        handleExit("getcwd failed", 1, 1, 1, 1, NULL);
+
+    sleep(1);
+    printf("$%s> ", cwd);
+}
+
+// Handle the Input and Parse it
+cmdLine *handleInputAndParse()
+{
+    char input[Max_String]; // Buffer
+    if (!fgets(input, sizeof(input), stdin))
+        handleExit("fgets failed", 1, EXIT_FAILURE, EXIT_FAILURE, 1, NULL);
+
+    return parseCmdLines(input); // Parse the input
+}
+
+// Check if the Command Line is Valid
+int validCmdLine(cmdLine *cmdLine)
+{
+    if (!cmdLine)
+    {
+        if (feof(stdin))
+            exit(0);
+
+        fprintf(stderr, "Error: got null command\n");
+        return 0;
+    }
+
+    if (!cmdLine->argCount)
+        handleExit("NO given arguments in the Command", 0, 0, 0, 1, cmdLine);
+
+    return 1;
+}
+
+/**
+ * Handle Special Commands
+ * return 0 if should continue, 1 if ok
+ */
+int handleSpecialCommand(cmdLine *cmdLine)
+{
+    if (strcmp(cmdLine->arguments[0], "quit") == 0)
+        handleExit(NULL, 0, 1, 0, 1, cmdLine);
+
+    if (strcmp(cmdLine->arguments[0], "cd") == 0)
+    {
+        if (chdir(cmdLine->arguments[1]) == -1)
+            fprintf(stderr, "Error in changing the directory");
+
+        freeCmdLines(cmdLine);
+        return 0;
+    }
+    return 1;
+}
+
+void handleSignalCommand(cmdLine *cmdLine)
+{
+    int cmdNo = 0;
+    int processID;
+
+    if (!strcmp(cmdLine->arguments[0], "stop"))
+        cmdNo = SIGSTOP;
+    else if (!strcmp(cmdLine->arguments[0], "wake"))
+        cmdNo = SIGCONT;
+    else if (!strcmp(cmdLine->arguments[0], "term"))
+        cmdNo = SIGINT;
+
+    else // not a special command
+    {
+        execute(cmdLine);
+        freeCmdLines(cmdLine);
+        cmdLine = NULL;
         return;
     }
 
-    pid_t pid = fork();
-    if (pid == -1) {
-        perror("fork");
-        return;
-    }
-
-    if (pid == 0) { // Child process
-        if (cmd->inputRedirect) {
-            freopen(cmd->inputRedirect, "r", stdin);
+    if (cmdNo) // a special command
+        if (cmdLine->argCount == 2)
+        {
+            processID = stoierr(cmdLine->arguments[1]);
+            if (processID != -1)
+                kill(processID, cmdNo);
         }
-        if (cmd->outputRedirect) {
-            freopen(cmd->outputRedirect, "w", stdout);
-        }
-
-        execvp(cmd->arguments[0], cmd->arguments);
-        perror("execvp");
-        exit(EXIT_FAILURE);
-    }
-
-    if (cmd->blocking) {
-        waitpid(pid, NULL, 0);
-    } else {
-        addProcess(&processList, cmd, pid);
-    }
+        else
+            fprintf(stderr, "Error in the number of arguments\n");
+    // else
+    //     printf("Error in the command\n");
 }
 
-// Execute a pipeline of two commands
-void executePipeline(cmdLine *cmd) {
-    int pipefd[2];           // Pipe file descriptors
-    int inputFd = 0;         // Input for the next command
-    pid_t pid;
-
-    while (cmd->next) {
-        pipe(pipefd);        // Create a new pipe
-
-        if ((pid = fork()) == -1) {
-            perror("fork");
-            exit(EXIT_FAILURE);
-        }
-
-        if (pid == 0) { // Child process
-            dup2(inputFd, STDIN_FILENO);  // Set the input for the current process
-            dup2(pipefd[1], STDOUT_FILENO); // Redirect stdout to pipe
-            close(pipefd[0]); // Close unused read end
-            execvp(cmd->arguments[0], cmd->arguments);
-            perror("execvp");
-            exit(EXIT_FAILURE);
-        } else {
-            waitpid(pid, NULL, 0); // Parent waits for the child
-            close(pipefd[1]);      // Close unused write end
-            inputFd = pipefd[0];   // Save read end for the next command
-            cmd = cmd->next;       // Move to the next command in the pipeline
-        }
-    }
-
-    // Last command in the pipeline
-    if ((pid = fork()) == -1) {
-        perror("fork");
-        exit(EXIT_FAILURE);
-    }
-
-    if (pid == 0) {
-        dup2(inputFd, STDIN_FILENO); // Set input for the final process
-        execvp(cmd->arguments[0], cmd->arguments);
-        perror("execvp");
-        exit(EXIT_FAILURE);
-    } else {
-        waitpid(pid, NULL, 0); // Parent waits for the final child
-    }
-}
-
-
-// Add a process to the process list
-void addProcess(process **processList, cmdLine *cmd, pid_t pid) {
-    process *newProcess = malloc(sizeof(process));
-    newProcess->cmd = cmd;
-    newProcess->pid = pid;
-    newProcess->status = RUNNING;
-    newProcess->next = *processList;
-    *processList = newProcess;
-}
-
-// Print the process list
-void printProcessList(process **processList) {
-    process *p = *processList;
-    printf("PID\t\tCommand\t\tStatus\n");
-    while (p) {
-        printf("%d\t\t%s\t\t%s\n", p->pid, p->cmd->arguments[0],
-               p->status == RUNNING ? "Running" : p->status == SUSPENDED ? "Suspended" : "Terminated");
-        p = p->next;
-    }
-}
-
-// Signal a process in the process list
-void signalProcess(process **processList, pid_t pid, int signal) {
-    process *p = *processList;
-    while (p) {
-        if (p->pid == pid) {
-            if (kill(pid, signal) == 0) {
-                if (signal == SIGTSTP)
-                    p->status = SUSPENDED;
-                else if (signal == SIGCONT)
-                    p->status = RUNNING;
-                else if (signal == SIGINT)
-                    p->status = TERMINATED;
-            } else {
-                perror("kill");
-            }
-            return;
-        }
-        p = p->next;
-    }
-    fprintf(stderr, "No process with PID %d found.\n", pid);
-}
-
-// Add a command to history
-void addHistory(char *cmd) {
-    // Trim trailing newline
-    size_t len = strlen(cmd);
-    if (len > 0 && cmd[len - 1] == '\n') {
-        cmd[len - 1] = '\0';
-    }
-
-    if (historyCount == HISTLEN) {
-        free(history[0]);
-        for (int i = 1; i < HISTLEN; i++) {
-            history[i - 1] = history[i];
-        }
-        historyCount--;
-    }
-    history[historyCount++] = strdup(cmd);
-}
-
-// Get a command from history
-char *getHistoryCommand(int index) {
-    if (index < 1 || index > historyCount) {
-        fprintf(stderr, "Invalid history index.\n");
-        return NULL;
-    }
-    return history[index - 1];
-}
-
-void printHistory() {
-    for (int i = 0; i < historyCount; i++) {
-        printf("%d %s\n", i + 1, history[i]); // Print command index and command string
+void handleRedirection(const char *filePath, int targetFd, int flags, cmdLine *pCmdLine)
+{
+    if (filePath)
+    {
+        close(targetFd);
+        if (open(filePath, flags, 0777) == -1)
+            handleExit("Error in opening the file", 1, 1, EXIT_FAILURE, 0, pCmdLine);
     }
 }
